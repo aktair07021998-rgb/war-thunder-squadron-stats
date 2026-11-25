@@ -28,6 +28,7 @@ jobs:
       - name: Пересчитать таблицы
         env:
           BRANCH: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -eu
           git config user.name 'github-actions[bot]'
@@ -35,7 +36,11 @@ jobs:
           for attempt in 1 2 3; do
             git fetch --no-tags origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
             git reset --hard "origin/$BRANCH"
-            python3 build_report.py
+            if [ "$EVENT_NAME" = workflow_dispatch ]; then
+              python3 build_report.py --publish
+            else
+              python3 build_report.py
+            fi
             git add -A
             if git diff --cached --quiet; then exit 0; fi
             git commit -m 'Обновить таблицы полка'
