@@ -1,9 +1,9 @@
-name: Обновить статистику полка
+name: Обновить таблицу игроков
 
 on:
   push:
     paths:
-      - snapshots.csv
+      - "Таблица игроков.csv"
       - build_report.py
       - .github/workflows/stats.yml
   workflow_dispatch:
@@ -17,10 +17,12 @@ concurrency:
 
 jobs:
   report:
+    name: Пересчёт статистики полка
     if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Получить файлы репозитория
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
       - name: Пересчитать таблицы

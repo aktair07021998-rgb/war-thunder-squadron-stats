@@ -1,4 +1,4 @@
-"""Build the squadron's GitHub tables from cumulative monthly snapshots."""
+"""Формирует таблицу игроков и отчёты полка по ежемесячным замерам."""
 
 import csv
 import html
@@ -9,6 +9,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
+TABLE_TITLE = "Таблица игроков"
+TABLE_FILE = f"{TABLE_TITLE}.csv"
 MODES = ("РБ", "СБ")
 METRICS = ("бои_земля", "время_земля", "бои_воздух", "время_воздух", "бои_всего")
 DURATIONS = {"время_земля", "время_воздух"}
@@ -16,7 +18,7 @@ COLUMNS = ("месяц", "дата", "игрок", "режим", *METRICS)
 LABELS = ("Земля, бои", "Земля, ч:мин", "Воздух, бои", "Воздух, ч:мин", "Всего боёв", "Всего, ч:мин")
 MONTHS = "Январь Февраль Март Апрель Май Июнь Июль Август Сентябрь Октябрь Ноябрь Декабрь".split()
 DASH = "—"
-GENERATED = "<!-- Generated from snapshots.csv by build_report.py -->"
+GENERATED = f"<!-- Отчёт сформирован по файлу «{TABLE_FILE}». -->"
 
 
 @dataclass
@@ -148,7 +150,7 @@ def activity(history, month, changes, notes):
 
 
 def nickname(text):
-    # Numeric entities preserve the visible nickname inside GitHub Markdown tables.
+    # Числовые коды сохраняют подчёркивания и другие символы ника при выводе в таблице.
     return re.sub(r"[|\\`*_~@!\[\]()]", lambda m: f"&#{ord(m[0])};", html.escape(text))
 
 
@@ -209,9 +211,9 @@ KEY = (
     "Ноль означает, что счётчик проверен."
 )
 
-GUIDE = """## Как внести замер
+GUIDE = f"""## Как внести замер
 
-Откройте [таблицу замеров](snapshots.csv). Для каждого игрока добавьте по одной строке РБ и СБ. Перепишите накопительные показатели из карточки игрока. GitHub Actions пересчитает главную таблицу и историю после сохранения CSV в основной ветке.
+Откройте файл [«{TABLE_TITLE}»](<{TABLE_FILE}>). Для каждого игрока добавьте по одной строке РБ и СБ. Перепишите накопительные показатели из карточки игрока. GitHub Actions пересчитает главную таблицу и историю после сохранения файла в основной ветке.
 
 | Поле | Что вписать |
 | --- | --- |
@@ -236,11 +238,11 @@ def write(path, parts):
 
 
 def build(root=ROOT):
-    players = load_snapshots(root / "snapshots.csv")
+    players = load_snapshots(root / TABLE_FILE)
     months = sorted({month for history in players.values() for month in history})
     reports = root / "reports"
     reports.mkdir(exist_ok=True)
-    readme = [GENERATED, "# Статистика полка War Thunder"]
+    readme = [GENERATED, f"# {TABLE_TITLE}"]
     for month in months:
         monthly, details, cumulative, source = period_tables(players, month)
         report = [GENERATED, f"# {month_name(month)}", "[На главную](../README.md)",
