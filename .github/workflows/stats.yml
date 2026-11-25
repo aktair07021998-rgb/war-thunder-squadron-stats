@@ -1,0 +1,42 @@
+name: Обновить статистику полка
+
+on:
+  push:
+    paths:
+      - snapshots.csv
+      - build_report.py
+      - .github/workflows/stats.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: squadron-stats-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - name: Пересчитать таблицы
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -eu
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          for attempt in 1 2 3; do
+            git fetch --no-tags origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            git reset --hard "origin/$BRANCH"
+            python3 build_report.py
+            git add -A
+            if git diff --cached --quiet; then exit 0; fi
+            git commit -m 'Обновить таблицы полка'
+            if git push origin "HEAD:refs/heads/$BRANCH"; then exit 0; fi
+          done
+          exit 1
