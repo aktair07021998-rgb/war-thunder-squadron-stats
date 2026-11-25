@@ -2,60 +2,90 @@
 
 import csv
 import html
+import io
 import re
-from dataclasses import dataclass
-from datetime import date, timedelta
+from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-TABLE_TITLE = "Таблица игроков"
-TABLE_FILE = f"{TABLE_TITLE}.csv"
+TITLE = "Таблица игроков"
+TABLE_FILE = f"{TITLE}.csv"
+SOURCE_FILE = "История замеров.csv"
+GENERATED = f"<!-- Сформировано по файлу «{SOURCE_FILE}». -->"
+OLD_MARKER = f"<!-- Отчёт сформирован по файлу «{TABLE_FILE}». -->"
 MODES = ("РБ", "СБ")
-METRICS = ("бои_земля", "время_земля", "бои_воздух", "время_воздух", "бои_всего")
-DURATIONS = {"время_земля", "время_воздух"}
-COLUMNS = ("месяц", "дата", "игрок", "режим", *METRICS)
-LABELS = ("Земля, бои", "Земля, ч:мин", "Воздух, бои", "Воздух, ч:мин", "Всего боёв", "Всего, ч:мин")
+METRICS = ("бои", "земля", "авиация")
+FIELDS = ("месяц", "дата", "игрок", *(f"{mode}_{key}" for mode in MODES for key in METRICS))
+BASE_HEADERS = ["Игрок", "РБ всего", "СБ всего", "Земля, ч:мин", "Воздух, ч:мин"]
 MONTHS = "Январь Февраль Март Апрель Май Июнь Июль Август Сентябрь Октябрь Ноябрь Декабрь".split()
+SHORT_MONTHS = "Янв. Фев. Март Апр. Май Июнь Июль Авг. Сент. Окт. Нояб. Дек.".split()
 DASH = "—"
-GENERATED = f"<!-- Отчёт сформирован по файлу «{TABLE_FILE}». -->"
+
+
+@dataclass
+class Reading:
+    taken: date
+    values: dict
 
 
 @dataclass
 class Snapshot:
     nick: str
     taken: date
+    modes: dict = field(default_factory=dict)
+
+
+@dataclass
+class Change:
     values: dict
+    note: str = ""
 
 
-def previous(month):
-    return (date.fromisoformat(month + "-01") - timedelta(days=1)).strftime("%Y-%m")
+def adjacent(month, step):
+    year, number = map(int, month.split("-"))
+    year, index = divmod(year * 12 + number - 1 + step, 12)
+    return f"{year:04d}-{index + 1:02d}"
 
 
-def month_name(month):
+def month_name(month, short=False):
     year, number = month.split("-")
-    return f"{MONTHS[int(number) - 1]} {year}"
+    names = SHORT_MONTHS if short else MONTHS
+    return f"{names[int(number) - 1]} {year}"
 
 
-def read_metric(field, raw):
-    if raw == "":
+def display_months(recorded):
+    if not recorded:
+        return []
+    first = adjacent(recorded[0], 1)
+    last = max(adjacent(first, 1), recorded[-1])
+    months = [first]
+    while months[-1] < last:
+        months.append(adjacent(months[-1], 1))
+    return months
+
+
+def read_metric(key, raw):
+    if not raw:
         return None
-    if field in DURATIONS:
-        match = re.fullmatch(r"([0-9]+):([0-5][0-9])", raw)
-        if match:
-            return int(match[1]) * 60 + int(match[2])
-        raise ValueError(f"поле {field} ожидает часы и минуты, например 127:05")
-    if not re.fullmatch(r"[0-9]+", raw):
-        raise ValueError(f"поле {field} ожидает целое число от нуля")
-    return int(raw)
+    if key == "бои":
+        if not re.fullmatch(r"[0-9]+", raw):
+            raise ValueError("число боёв должно быть целым и неотрицательным")
+        return int(raw)
+    match = re.fullmatch(r"([0-9]+):([0-5][0-9])", raw)
+    if not match:
+        raise ValueError("время указывается в часах и минутах, например 127:05")
+    return int(match[1]) * 60 + int(match[2])
 
 
 def load_snapshots(path):
     players = {}
+    seen = set()
     with path.open(encoding="utf-8-sig", newline="") as source:
         rows = csv.DictReader(source)
-        if rows.fieldnames != list(COLUMNS):
-            raise ValueError("Проверьте заголовки CSV: " + ",".join(COLUMNS))
+        if rows.fieldnames != list(FIELDS):
+            raise ValueError("Проверьте заголовки в истории замеров.")
         for row in rows:
             try:
                 if None in row:
@@ -63,33 +93,33 @@ def load_snapshots(path):
                 fields = {key: (value or "").strip() for key, value in row.items()}
                 if not any(fields.values()):
                     continue
-                month, nick, mode = fields["месяц"], fields["игрок"], fields["режим"].upper()
-                if not re.fullmatch(r"[0-9]{4}-[0-9]{2}", month):
+                month, day, nick = (fields[key] for key in FIELDS[:3])
+                if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", month):
                     raise ValueError("месяц указывается в формате ГГГГ-ММ")
-                date.fromisoformat(month + "-01")
-                taken = date.fromisoformat(fields["дата"])
-                if taken.isoformat() != fields["дата"]:
-                    raise ValueError("дату замера указывают в формате ГГГГ-ММ-ДД")
+                try:
+                    taken = date.fromisoformat(day)
+                except ValueError:
+                    raise ValueError("укажите действительную дату в формате ГГГГ-ММ-ДД") from None
+                if taken.isoformat() != day:
+                    raise ValueError("дата указывается в формате ГГГГ-ММ-ДД")
                 if not nick or any(ord(char) < 32 for char in nick):
                     raise ValueError("нужен игровой ник в одну строку")
-                if mode not in MODES:
-                    raise ValueError("укажите режим РБ или СБ")
-                values = {key: read_metric(key, fields[key]) for key in METRICS}
-                by_mode = players.setdefault(nick.casefold(), {}).setdefault(month, {})
-                if mode in by_mode:
-                    raise ValueError(f"повтор замера {nick} / {month} / {mode}")
-                by_mode[mode] = Snapshot(nick, taken, values)
+                identity = (nick.casefold(), taken)
+                if identity in seen:
+                    raise ValueError(f"повтор замера {nick} за {day}")
+                seen.add(identity)
+                history = players.setdefault(nick.casefold(), {})
+                period = history.setdefault(month, Snapshot(nick, taken))
+                if taken > period.taken:
+                    period.nick, period.taken = nick, taken
+                for mode in MODES:
+                    values = {key: read_metric(key, fields[f"{mode}_{key}"]) for key in METRICS}
+                    existing = period.modes.get(mode)
+                    if any(v is not None for v in values.values()) and (not existing or taken > existing.taken):
+                        period.modes[mode] = Reading(taken, values)
             except ValueError as exc:
-                raise ValueError(f"Строка {rows.line_num}: {exc}") from exc
+                raise ValueError(f"Строка {rows.line_num}. {exc}") from exc
     return players
-
-
-def sum_known(values):
-    return sum(values) if all(value is not None for value in values) else None
-
-
-def by_mode_total(values):
-    return {key: sum_known([values.get(mode, {}).get(key) for mode in MODES]) for key in METRICS}
 
 
 def show(value, duration=False):
@@ -101,170 +131,163 @@ def show(value, duration=False):
     return str(value)
 
 
-def cells(values):
-    result = [show(values.get(key), key in DURATIONS) for key in METRICS]
-    return result + [show(sum_known([values.get(key) for key in DURATIONS]), duration=True)]
+def sum_known(values):
+    return sum(values) if all(value is not None for value in values) else None
 
 
-def change(old, new):
-    if new is None:
-        return {}, "Нет замера"
-    if old is None:
-        return {}, "Нет прошлого замера"
-    if old.taken >= new.taken:
-        return {}, "Сверить даты"
-    values = {}
+def current_totals(snapshot):
+    values = [snapshot.modes[mode].values if mode in snapshot.modes else {} for mode in MODES]
+    counts = [show(mode.get("бои")) for mode in values]
+    times = [show(sum_known([mode.get(key) for mode in values]), duration=True) for key in METRICS[1:]]
+    return counts + times
+
+
+def change(start, end):
+    if not start or not end:
+        return Change({}, "пропущен замер")
+    if end.taken <= start.taken:
+        return Change({}, "проверьте даты")
+    result = {}
     decreased = []
-    for key, label in zip(METRICS, LABELS):
-        start, end = old.values[key], new.values[key]
-        if start is None or end is None:
-            values[key] = None
-        elif end < start:
-            values[key] = None
-            decreased.append(label.lower())
+    for key in METRICS:
+        before, after = start.values[key], end.values[key]
+        if before is None or after is None:
+            continue
+        if after < before:
+            decreased.append(key)
         else:
-            values[key] = end - start
-    if decreased:
-        return values, "Сверить (" + ", ".join(decreased) + ")"
-    return values, ""
+            result[key] = after - before
+    note = "уменьшился счётчик (" + ", ".join(decreased) + ")" if decreased else ""
+    return Change(result, note)
 
 
-def activity(history, month, changes, notes):
-    if month not in history:
-        return "Нет замера"
-    if not any(earlier < month for earlier in history):
-        return "Первый замер"
-    if previous(month) not in history:
-        return "Пропущен прошлый замер"
-    if any(note.startswith("Сверить") for note in notes.values()):
-        return "Сверить данные"
-    played = any(value for mode in MODES for value in changes[mode].values() if value is not None)
-    known = all(
-        changes[mode].get("бои_всего") is not None
-        or all(changes[mode].get(key) is not None for key in METRICS[:4])
-        for mode in MODES
-    )
-    if played:
-        return "Играл" if known else "Играл (часть данных)"
-    return "Без активности" if known else "Недостаточно данных"
+def trend(before, after):
+    if before is None or after is None:
+        return DASH
+    difference = after - before
+    if difference > 0:
+        return f"🟩 +{difference}"
+    return "🟥 0" if difference == 0 else f"🟥 −{abs(difference)}"
 
 
 def nickname(text):
-    # Числовые коды сохраняют подчёркивания и другие символы ника при выводе в таблице.
+    # Сохраняем подчёркивания и другие символы ника при выводе в Markdown.
     return re.sub(r"[|\\`*_~@!\[\]()]", lambda m: f"&#{ord(m[0])};", html.escape(text))
 
 
 def table(headers, rows):
     def line(items):
         return "| " + " | ".join(items) + " |"
-    return "\n".join([line(headers), line(["---"] * len(headers)), *(line(row) for row in rows)])
+    formatted = (line([nickname(row[0]), *row[1:]]) for row in rows)
+    return "\n".join([line(headers), line(["---", *["---:"] * (len(headers) - 1)]), *formatted])
 
 
-def date_text(snapshot):
-    return snapshot.taken.strftime("%d.%m.%Y") if snapshot else DASH
+def csv_table(headers, rows):
+    out = io.StringIO(newline="")
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return out.getvalue()
 
 
-def date_range(snapshots):
-    dates = sorted({sample.taken for sample in snapshots.values()})
-    if not dates:
-        return DASH
-    first, last = (day.strftime("%d.%m.%Y") for day in (dates[0], dates[-1]))
-    return first if first == last else f"{first} – {last}"
+def number_cells(values):
+    return [show(values.get(key), duration=key != "бои") for key in METRICS]
 
 
-def period_tables(players, month):
-    summary, details, cumulative, source_detail = [], [], [], []
-    for key, history in sorted(players.items()):
-        seen = [period for period in history if period <= month]
-        if not seen:
-            continue
-        last_month = max(seen)
-        latest = history[last_month]
-        player = nickname(max(latest.values(), key=lambda sample: sample.taken).nick)
-        current = history.get(month, {})
-        prior = history.get(previous(month), {})
-        changes, notes = {}, {}
-        for mode in MODES:
-            old, new = prior.get(mode), current.get(mode)
-            values, note = change(old, new)
-            changes[mode], notes[mode] = values, note
-            details.append([player, mode, date_text(old), date_text(new), *cells(values), note or DASH])
-            if new:
-                source_detail.append([player, mode, date_text(new), *cells(new.values)])
-        state = activity(history, month, changes, notes)
-        summary.append([player, state, *cells(by_mode_total(changes))])
-        totals = by_mode_total({mode: sample.values for mode, sample in latest.items()})
-        cumulative.append([player, date_range(latest), *cells(totals)])
-    return (
-        table(["Игрок", "Активность", *LABELS], summary),
-        table(["Игрок", "Режим", "С", "По", *LABELS, "Примечание"], details),
-        table(["Игрок", "Последний замер", *LABELS], cumulative),
-        table(["Игрок", "Режим", "Дата", *LABELS], source_detail),
-    )
+def date_text(reading):
+    return reading.taken.strftime("%d.%m.%Y") if reading else DASH
 
 
-KEY = (
-    "Бои и время показаны отдельно для наземной и воздушной техники. "
-    "«Всего боёв» берётся из общего счётчика каждого режима. "
-    "В одном бою игрок может использовать несколько видов техники. "
-    "Прочерк означает, что для расчёта не хватает данных. "
-    "Ноль означает, что счётчик проверен."
-)
-
-GUIDE = f"""## Как внести замер
-
-Откройте файл [«{TABLE_TITLE}»](<{TABLE_FILE}>). Для каждого игрока добавьте по одной строке РБ и СБ. Перепишите накопительные показатели из карточки игрока. GitHub Actions пересчитает главную таблицу и историю после сохранения файла в основной ветке.
-
-| Поле | Что вписать |
-| --- | --- |
-| месяц | Месяц, который закрывает замер, в формате ГГГГ-ММ. Для отчёта за декабрь стартовый снимок на 1 декабря закрывает ноябрь, итоговый на 31 декабря или 1 января закрывает декабрь. |
-| дата | Фактическая дата снимка в формате ГГГГ-ММ-ДД. При сборе в разные дни отчёт покажет даты каждого замера. |
-| игрок, режим | Игровой ник и РБ или СБ. При смене ника обновите и старые строки этого игрока. |
-| бои_земля, время_земля | Суммарные показатели наземной техники, включая танки, САУ и зенитки. |
-| бои_воздух, время_воздух | Суммарные показатели авиации, включая истребители, штурмовики, бомбардировщики и вертолёты. |
-| бои_всего | Общее число боёв в этом режиме из карточки игрока, если оно есть. |
-
-Время вводится в часах и минутах. Например, 2 суток 3 часа 15 минут записываются как `51:15`. Если показатель на снимке отсутствует, оставьте ячейку пустой. Подтверждённый ноль вводится как `0` боёв или `0:00` времени.
-
-Первый замер даёт исходные значения. Ежемесячный отчёт вычитает из нового замера значения за предыдущий отчётный месяц у того же игрока в том же режиме. Если месяц пропущен, нового игрока ещё не с чем сравнить или счётчик уменьшился, таблица покажет причину. Сводка РБ + СБ складывает показатель, когда известны оба режима. Данные одного режима видны в подробном отчёте.
-
-**Пример.** У игрока было 100 наземных боёв и `40:50` в СБ. На следующем снимке — 112 боёв и `44:10`. За период в СБ он сыграл на земле 12 боёв и провёл 3 ч 20 мин.
-
-Для пересчёта на компьютере выполните `python3 build_report.py` из папки репозитория. Требуется Python 3.8 или новее."""
+def mode_headers(first_label):
+    headers = ["Игрок"]
+    for mode in MODES:
+        headers.extend([f"{first_label} {mode}", f"Бои {mode}", f"Земля {mode}, ч:мин", f"Воздух {mode}, ч:мин"])
+    return headers
 
 
-def write(path, parts):
-    path.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+def make_rows(players, recorded, months):
+    summary = []
+    report_rows = {m: ([], []) for m in recorded}
+    for history in players.values():
+        first, last = min(history), max(history)
+        latest = history[last]
+        row = [latest.nick, *current_totals(latest)]
+        counts = {}
+        for month in sorted(set(recorded) | set(months)):
+            prior = history.get(adjacent(month, -1))
+            current = history.get(month)
+            nick = current.nick if current else latest.nick
+            source, activity, notes = [nick], [nick], []
+            counts[month] = {}
+            for mode in MODES:
+                start = prior.modes.get(mode) if prior else None
+                end = current.modes.get(mode) if current else None
+                delta = change(start, end)
+                counts[month][mode] = delta.values.get("бои")
+                source.extend([date_text(end), *number_cells(end.values if end else {})])
+                span = f"{date_text(start)} – {date_text(end)}" if start and end else DASH
+                activity.extend([span, *number_cells(delta.values)])
+                if delta.note:
+                    notes.append(f"{mode} — {delta.note}")
+            if month in report_rows and month >= first:
+                sources, changes = report_rows[month]
+                if current:
+                    sources.append(source)
+                if month != recorded[0]:
+                    changes.append([*activity, ". ".join(notes) or DASH])
+        for month in months:
+            row.extend(show(counts[month][mode]) for mode in MODES)
+        row.extend(trend(counts[months[-2]][mode], counts[months[-1]][mode]) for mode in MODES)
+        summary.append(row)
+    return summary, report_rows
+
+
+GUIDE = f"""<details>
+<summary>Как добавить следующий замер</summary>
+
+Добавьте в [историю замеров](<{SOURCE_FILE}>) одну строку на игрока и дату. Обе вкладки, РБ и СБ, записываются рядом. В поле «месяц» укажите отчётный месяц в формате ГГГГ-ММ, в поле «дата» — день замера. Если дата на скриншоте неизвестна, используйте день получения. При уточнении замера за тот же месяц учитывается самая свежая запись каждого режима.
+
+В разделе «Случайные бои» возьмите число из строки «Миссий завершено». Для наземного времени сложите танки, тяжёлые танки, САУ и ЗСУ. Для воздушного — истребители, бомбардировщики, штурмовики и вертолёты. Флот, полигон и отдельные миссии в сумму времени не входят. Время вводится в часах и минутах. Пустое поле означает, что значения нет, `0` и `0:00` — подтверждённый ноль.
+
+Первый месяц наблюдения задаёт исходные значения. Бои за месяц считаются по разнице накопительных счётчиков двух соседних отчётных месяцев. Даты обоих снимков видны в месячном отчёте. Для полного календарного месяца снимайте показания на его границах. Например, снимок на 1 декабря можно отнести к закрытию ноября. При пропущенном замере или уменьшении накопительного счётчика в соответствующей ячейке появится прочерк. Для общей суммы времени нужны показания обеих вкладок игрока за один отчётный месяц.
+
+GitHub Actions обновит таблицу после сохранения истории в основной ветке. Для пересчёта на компьютере выполните `python3 build_report.py`.
+
+</details>"""
 
 
 def build(root=ROOT):
-    players = load_snapshots(root / TABLE_FILE)
-    months = sorted({month for history in players.values() for month in history})
+    players = load_snapshots(root / SOURCE_FILE)
+    recorded = sorted({month for history in players.values() for month in history})
+    months = display_months(recorded)
+    headers = [*BASE_HEADERS, *(f"{month_name(m, short=True)} {mode}" for m in months for mode in MODES),
+               "Δ РБ", "Δ СБ"]
+    summary, report_rows = make_rows(players, recorded, months)
+    contents = {root / TABLE_FILE: csv_table(headers, summary)}
+    intro = [GENERATED, f"# {TITLE}"]
+    if players:
+        latest = max(p.taken for history in players.values() for p in history.values())
+        intro.append(f"Самая свежая запись от **{latest:%d.%m.%Y}**. Время на земле и в воздухе суммируется по РБ и СБ. Если карточка показывает только целые дни, сумма времени приблизительная.")
+    intro.extend([table(headers, summary),
+                  "Δ РБ и Δ СБ сравнивают бои за два последних месяца в таблице. 🟩 Рост, 🟥 столько же или меньше, — пока нет двух сопоставимых значений.",
+                  f"[Открыть таблицу в CSV](<{TABLE_FILE}>) · [История замеров](<{SOURCE_FILE}>)"])
     reports = root / "reports"
-    reports.mkdir(exist_ok=True)
-    readme = [GENERATED, f"# {TABLE_TITLE}"]
-    for month in months:
-        monthly, details, cumulative, source = period_tables(players, month)
-        report = [GENERATED, f"# {month_name(month)}", "[На главную](../README.md)",
-                  "## Активность за месяц", monthly, KEY, "## Изменения по режимам", details,
-                  "## Показания карточек за этот месяц", source]
-        write(reports / f"{month}.md", report)
-    if months:
-        latest = months[-1]
-        readme.extend([f"## {month_name(latest)} · активность за месяц", monthly,
-                       f"[Открыть разбивку по РБ и СБ и даты замеров](reports/{latest}.md)",
-                       "## Накопительная статистика", cumulative, KEY,
-                       "## Отчёты по месяцам",
-                       "\n".join(f"- [{month_name(m)}](reports/{m}.md)" for m in reversed(months))])
-    else:
-        readme.extend(["## Активность за месяц",
-                       "Таблица ждёт первых карточек игроков. После второго ежемесячного замера здесь появится прирост.",
-                       table(["Игрок", "Активность", *LABELS], []),
-                       "## Накопительная статистика",
-                       table(["Игрок", "Последний замер", *LABELS], []), KEY])
-    write(root / "README.md", [*readme, GUIDE])
+    for month, (sources, changes) in report_rows.items():
+        parts = [GENERATED, f"# {month_name(month)}", "[Таблица игроков](../README.md)"]
+        if changes:
+            parts.extend(["## Активность между замерами", table([*mode_headers("Период"), "Примечание"], changes)])
+        parts.extend(["## Накопительные показания карточек", table(mode_headers("Дата"), sources)])
+        contents[reports / f"{month}.md"] = "\n\n".join(parts) + "\n"
+    if recorded:
+        intro.extend(["## Замеры по месяцам",
+                      "\n".join(f"- [{month_name(m)}](reports/{m}.md)" for m in reversed(recorded))])
+    contents[root / "README.md"] = "\n\n".join([*intro, GUIDE]) + "\n"
+    if recorded:
+        reports.mkdir(exist_ok=True)
+    for path, body in contents.items():
+        path.write_text(body, encoding="utf-8")
     for path in reports.glob("????-??.md"):
-        if path.stem not in months and path.read_text(encoding="utf-8").startswith(GENERATED + "\n"):
+        if path not in contents and path.read_text(encoding="utf-8").startswith((GENERATED + "\n", OLD_MARKER + "\n")):
             path.unlink()
 
 

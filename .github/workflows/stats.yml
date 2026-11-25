@@ -3,7 +3,7 @@ name: Обновить таблицу игроков
 on:
   push:
     paths:
-      - "Таблица игроков.csv"
+      - "История замеров.csv"
       - build_report.py
       - .github/workflows/stats.yml
   workflow_dispatch:
