@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TITLE = "Таблица игроков"
 TABLE = f"{TITLE}.csv"
+TRIAL_TABLE = "Проверка таблицы.csv"
 SOURCE = "История замеров.csv"
 MARKER = f"<!-- Сформировано по файлу «{SOURCE}». -->"
 MODES = ("РБ", "СБ")
@@ -32,10 +33,20 @@ def month_name(month):
     return f"{MONTH_NAMES[int(number) - 1]} {year}"
 
 
+def parse_day(raw):
+    try:
+        taken = date.fromisoformat(raw)
+    except ValueError:
+        taken = None
+    if taken is None or taken.isoformat() != raw:
+        raise ValueError("укажите дату в формате ГГГГ-ММ-ДД")
+    return taken
+
+
 def load_history(path):
-    # Для каждой вкладки сохраняется последняя известная запись отчётного месяца.
     players = {}
-    seen = set()
+    by_day = {}
+    trials = set()
     with path.open(encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         if not set(FIELDS).issubset(reader.fieldnames or ()):
@@ -45,36 +56,40 @@ def load_history(path):
                 if None in row:
                     raise ValueError("лишний столбец")
                 month, day, nick, rb, sb = ((row[name] or "").strip() for name in FIELDS)
-                if not any((month, day, nick, rb, sb)):
+                trial_from = (row.get("проверка_от") or "").strip()
+                if not any((month, day, nick, rb, sb, trial_from)):
                     continue
                 if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", month):
                     raise ValueError("укажите отчётный месяц в формате ГГГГ-ММ")
                 if not nick or any(ord(c) < 32 for c in nick):
                     raise ValueError("укажите игровой ник в одну строку")
-                try:
-                    taken = date.fromisoformat(day)
-                except ValueError:
-                    raise ValueError("укажите дату в формате ГГГГ-ММ-ДД") from None
-                if taken.isoformat() != day:
-                    raise ValueError("укажите дату в формате ГГГГ-ММ-ДД")
+                taken = parse_day(day)
                 key = nick.casefold()
-                if (key, taken) in seen:
+                daily = by_day.setdefault(key, {})
+                if taken in daily:
                     raise ValueError(f"повтор снимка игрока {nick} за {day}")
-                seen.add((key, taken))
-                history = players.setdefault(key, {})
-                period = history.setdefault(month, {})
-                if "ник" not in period or taken > period["ник"][0]:
-                    period["ник"] = (taken, nick)
+                reading = {"ник": (taken, nick)}
                 for mode, raw in zip(MODES, (rb, sb)):
                     if not raw:
                         continue
                     if not re.fullmatch(r"[0-9]+", raw):
                         raise ValueError(f"счётчик {mode} должен быть целым и неотрицательным")
-                    if mode not in period or taken > period[mode][0]:
-                        period[mode] = (taken, int(raw))
+                    reading[mode] = (taken, int(raw))
+                daily[taken] = reading
+                if trial_from:
+                    start = parse_day(trial_from)
+                    if start >= taken:
+                        raise ValueError("дата начала проверки должна предшествовать дате замера")
+                    trials.add((taken, start))
+                    continue
+                # Для каждого режима берём последний основной замер отчётного месяца.
+                period = players.setdefault(key, {}).setdefault(month, {})
+                for field, value in reading.items():
+                    if field not in period or taken > period[field][0]:
+                        period[field] = value
             except ValueError as exc:
                 raise ValueError(f"Строка {reader.line_num}. {exc}") from exc
-    return players
+    return players, by_day, trials
 
 
 def cell(value):
@@ -112,32 +127,33 @@ def escape_nick(nick):
     return re.sub(r"[|\\\x60*_~@!\[\]()$]", lambda m: f"&#{ord(m[0])};", html.escape(nick))
 
 
-def column_title(players, month, mode, fallback):
-    if not month:
+def column_title(players, period, mode, fallback):
+    if not period:
         return f"{fallback} {mode}"
+    if isinstance(period, date):
+        return f"{period:%d.%m.%Y} {mode}"
     dates = set()
     for history in players.values():
-        reading = history.get(month, {}).get(mode)
+        reading = history.get(period, {}).get(mode)
         if reading:
             dates.add(reading[0])
-    label = next(iter(dates)).strftime("%d.%m.%Y") if len(dates) == 1 else month_name(month)
+    label = next(iter(dates)).strftime("%d.%m.%Y") if len(dates) == 1 else month_name(period)
     return f"{label} {mode}"
 
 
-def period_table(players, end_month):
-    start_month = adjacent(end_month, -1) if end_month else None
+def period_table(players, start, end, duration="за месяц"):
     headers = ["Игрок"]
-    for month, label in ((start_month, "Первый замер"), (end_month, "Второй замер")):
-        headers.extend(column_title(players, month, mode, label) for mode in MODES)
-    headers.extend(["РБ за месяц", "СБ за месяц"])
+    for period, label in ((start, "Первый замер"), (end, "Второй замер")):
+        headers.extend(column_title(players, period, mode, label) for mode in MODES)
+    headers.extend(f"{mode} {duration}" for mode in MODES)
 
     records = []
     for history in players.values():
-        known_months = [m for m in history if m <= end_month]
-        if not known_months:
+        known = [key for key in history if key <= end]
+        if not known:
             continue
-        nick = history[max(known_months)]["ник"][1]
-        before, after = history.get(start_month, {}), history.get(end_month, {})
+        nick = history[max(known)]["ник"][1]
+        before, after = history.get(start, {}), history.get(end, {})
         rb, sb = (played(before.get(mode), after.get(mode)) for mode in MODES)
         records.append((nick, snapshot_cells(before) + snapshot_cells(after), rb, sb))
 
@@ -146,7 +162,7 @@ def period_table(players, end_month):
     mean = DASH
     if count:
         mean = f"{Decimal(total) / count:.2f}".rstrip("0").rstrip(".").replace(".", ",")
-    average_row = ["Среднее СБ на игрока за месяц", "", "", "", "", "", mean]
+    average_row = [f"Среднее СБ на игрока {duration}", "", "", "", "", "", mean]
     plain = [average_row]
     rich = [[f"**{value}**" if value and value != DASH else value for value in average_row]]
     for nick, snapshots, rb, sb in records:
@@ -186,7 +202,7 @@ LEGEND = (
 
 
 def build(root=ROOT, publish=False):
-    players = load_history(root / SOURCE)
+    players, by_day, trials = load_history(root / SOURCE)
     if not publish and not (root / TABLE).is_file():
         return False
     months = sorted({month for history in players.values() for month in history})
@@ -198,7 +214,8 @@ def build(root=ROOT, publish=False):
     outputs = {}
     reports = root / "reports"
     for period in completed or [displayed]:
-        headers, plain, rich, count = period_table(players, period)
+        start = adjacent(period, -1) if period else None
+        headers, plain, rich, count = period_table(players, start, period)
         table = markdown_table(headers, rich)
         coverage = f"Среднее по СБ рассчитано для {count} из {len(plain) - 1} игроков."
         if not count:
@@ -213,6 +230,15 @@ def build(root=ROOT, publish=False):
                      "Для следующего замера добавьте в историю одну строку на игрока и дату. "
                      "На вкладках РБ и СБ возьмите счётчик «Миссий завершено» из раздела «Случайные бои».",
                      f"[Таблица в CSV](<{TABLE}>) · {source_link}"]
+            if trials:
+                last, first = max(trials)
+                trial_headers, trial_plain, trial_rows, trial_count = period_table(by_day, first, last, "за период")
+                outputs[root / TRIAL_TABLE] = csv_text(trial_headers, trial_plain)
+                parts.extend(["## Проверка алгоритма", markdown_table(trial_headers, trial_rows),
+                              f"Игроков с двумя замерами СБ за этот период — {trial_count} из {len(trial_rows) - 1}. "
+                              "Для пробы укажите в истории дату первого замера в столбце «проверка_от». "
+                              "Для основного замера оставьте этот столбец пустым.",
+                              f"[Пробная таблица в CSV](<{TRIAL_TABLE}>)"])
             if completed:
                 parts.extend(["## Отчёты по месяцам", "\n".join(
                     f"- [{month_name(m)}](reports/{m}.md)" for m in reversed(completed))])
@@ -221,6 +247,8 @@ def build(root=ROOT, publish=False):
         reports.mkdir(exist_ok=True)
     for path, body in outputs.items():
         path.write_text(body, encoding="utf-8")
+    if not trials:
+        (root / TRIAL_TABLE).unlink(missing_ok=True)
     for path in reports.glob("????-??.md"):
         if path not in outputs and path.read_text(encoding="utf-8").startswith(MARKER + "\n"):
             path.unlink()
